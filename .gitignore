@@ -1,0 +1,25 @@
+# Dependencies
+frontend/node_modules/
+backend/__pycache__/
+__pycache__/
+*.pyc
+
+# Build
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Docker volumes
+data/
+frontend/src/assets/hero.png
+frontend/src/assets/react.svg
+frontend/src/assets/vite.svg

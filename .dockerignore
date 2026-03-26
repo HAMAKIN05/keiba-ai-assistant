@@ -1,0 +1,25 @@
+# Dependencies
+frontend/node_modules/
+backend/__pycache__/
+__pycache__/
+
+# Build artifacts (will be rebuilt in Docker)
+frontend/dist/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.yml
+
+# Logs
+*.log
