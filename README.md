@@ -13,19 +13,31 @@
 - **騎手成績** - 通算騎乗数・勝利数・勝率・連対率・複勝率
 - **AI分析プロンプト** - 脚質分析・展開予想・距離適性・馬場適性を含む詳細プロンプトを自動生成
 - **1クリックコピー** - GenSparkにそのまま貼り付けて予想を得られる
+- **IPブロック対策** - HTMLキャッシュ + データキャッシュ + プロキシ設定対応
+- **データインポートAPI** - 外部ツールで取得したデータをAPI経由でインポート可能
 
 ## セットアップ
 
 ### Docker（推奨）
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/keiba-ai-assistant.git
+git clone https://github.com/HAMAKIN05/keiba-ai-assistant.git
 cd keiba-ai-assistant
 
 # 起動
 docker compose up -d
 
 # → http://localhost:8000 でアクセス
+```
+
+### プロキシ設定（netkeiba.comからIPブロックされた場合）
+
+```bash
+# docker-compose.yml に環境変数を追加
+services:
+  app:
+    environment:
+      - HTTP_PROXY=http://your-proxy:port
 ```
 
 ### ローカル開発
@@ -52,6 +64,19 @@ npm run build  # → dist/ に本番ビルド（FastAPIが配信）
 5. 「プロンプトをコピーする」ボタンをクリック
 6. [GenSpark](https://www.genspark.ai) を開いて貼り付け → 送信
 
+## API エンドポイント
+
+| エンドポイント | メソッド | 説明 |
+|---|---|---|
+| `/api/health` | GET | ヘルスチェック（IPブロック状態も返す） |
+| `/api/status` | GET | 接続状態確認 |
+| `/api/race_dates` | GET | 開催日一覧 |
+| `/api/races` | GET | 指定日のレース一覧 |
+| `/api/race/{id}/full` | GET | レース全データ + プロンプト |
+| `/api/import_race_list` | POST | レース一覧データをインポート |
+| `/api/import_race_full` | POST | レース詳細データをインポート |
+| `/api/reset_block` | POST | IPブロックフラグをリセット |
+
 ## プロンプトに含まれる情報
 
 | カテゴリ | データ |
@@ -67,6 +92,7 @@ npm run build  # → dist/ に本番ビルド（FastAPIが配信）
 - **フロントエンド**: React + Tailwind CSS + Vite
 - **バックエンド**: Python FastAPI
 - **データ取得**: netkeiba.com スクレイピング (httpx + BeautifulSoup)
+- **キャッシュ**: HTMLキャッシュ + JSONデータキャッシュ（IPブロック対策）
 - **デプロイ**: Docker
 
 ## ディレクトリ構成
@@ -76,9 +102,10 @@ npm run build  # → dist/ に本番ビルド（FastAPIが配信）
 ├── docker-compose.yml
 ├── backend/
 │   ├── main.py              # FastAPI アプリ
-│   ├── scraper.py           # netkeiba スクレイパー
+│   ├── scraper.py           # netkeiba スクレイパー（キャッシュ+リトライ付き）
 │   ├── prompt_generator.py  # GenSpark プロンプト生成
 │   ├── models.py            # データモデル
+│   ├── data_cache.py        # JSONデータキャッシュ
 │   └── requirements.txt
 └── frontend/
     ├── src/
@@ -92,20 +119,21 @@ npm run build  # → dist/ に本番ビルド（FastAPIが配信）
     └── index.html
 ```
 
-## VPS等へのデプロイ例
+## IPブロック対策
 
-```bash
-# サーバーにDockerがインストールされていれば
-git clone https://github.com/YOUR_USERNAME/keiba-ai-assistant.git
-cd keiba-ai-assistant
-docker compose up -d
+netkeiba.comは過度なリクエストに対してIPブロックを行うことがあります。
 
-# 自動起動設定（再起動後も自動で立ち上がる）
-# docker-compose.yml に restart: unless-stopped が設定済み
-```
+**対策**:
+1. **レートリミット**: リクエスト間隔を0.5秒に設定
+2. **HTMLキャッシュ**: 取得済みページを24時間キャッシュ
+3. **データキャッシュ**: 解析済みデータを12時間キャッシュ
+4. **プロキシ対応**: `HTTP_PROXY`環境変数でプロキシ設定可能
+5. **データインポート**: 外部ツールで取得したデータをAPIでインポート可能
+6. **IPブロック検知**: 400/403レスポンスを検知し、UIに分かりやすく表示
 
 ## 注意事項
 
 - データは netkeiba.com からリアルタイムで取得しています
 - 個人利用の範囲でお使いください
 - 馬券の購入は自己責任でお願いします
+- 過度なリクエストを避けるためレートリミットを設定しています

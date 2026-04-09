@@ -5,10 +5,10 @@ from datetime import datetime, timedelta
 from dataclasses import asdict
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from scraper import (
     fetch_race_list,
@@ -17,6 +17,10 @@ from scraper import (
     fetch_odds,
     fetch_jockey_info,
     fetch_race_full_data,
+    is_ip_blocked,
+    reset_ip_block,
+    save_html_to_cache,
+    IPBlockedError,
 )
 from prompt_generator import generate_prompt
 
@@ -40,9 +44,113 @@ app.add_middleware(
 )
 
 
+# --- IPブロックエラーハンドラ ---
+@app.exception_handler(IPBlockedError)
+async def ip_blocked_handler(request: Request, exc: IPBlockedError):
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": "ip_blocked",
+            "message": str(exc),
+            "detail": "netkeiba.comからIPアドレスがブロックされています。"
+                      "別のネットワークから接続するか、プロキシを設定してください。"
+                      "Docker環境でHTTP_PROXY環境変数を設定することで回避できます。",
+        }
+    )
+
+
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "message": "競馬予想アプリ稼働中 🏇"}
+    return {
+        "status": "ok",
+        "message": "競馬予想アプリ稼働中 🏇",
+        "ip_blocked": is_ip_blocked(),
+    }
+
+
+@app.get("/api/status")
+async def status():
+    """接続状態を確認"""
+    return {
+        "ip_blocked": is_ip_blocked(),
+        "message": "netkeiba.comへの接続がブロックされています" if is_ip_blocked()
+                   else "正常に接続できます",
+    }
+
+
+@app.post("/api/reset_block")
+async def reset_block():
+    """IPブロックフラグをリセット"""
+    reset_ip_block()
+    return {"message": "IPブロックフラグをリセットしました。再度アクセスを試みます。"}
+
+
+@app.post("/api/cache")
+async def cache_html(request: Request):
+    """外部からHTMLをキャッシュに保存（プリフェッチ用）
+    
+    Body: {"url": "https://...", "html": "<html>..."}
+    """
+    try:
+        body = await request.json()
+        url = body.get("url", "")
+        html = body.get("html", "")
+        if not url or not html:
+            raise HTTPException(status_code=400, detail="url and html are required")
+        save_html_to_cache(url, html)
+        return {"message": f"Cached {len(html)} chars for {url}"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/import_race_list")
+async def import_race_list(request: Request):
+    """外部からレースリストデータをインポート（プリフェッチ用）
+    
+    Body: {"date": "20260409", "source": "nar", "races": [...]}
+    """
+    from data_cache import set_cached_data
+    from models import RaceListItem
+    try:
+        body = await request.json()
+        date = body.get("date", "")
+        source = body.get("source", "nar")
+        races = body.get("races", [])
+        if not date or not races:
+            raise HTTPException(status_code=400, detail="date and races are required")
+        
+        key = f"race_list_{source}_{date}"
+        set_cached_data(key, {"races": races})
+        return {"message": f"Imported {len(races)} races for {date} ({source})"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/import_race_full")
+async def import_race_full(request: Request):
+    """外部からフルレースデータをインポート（プリフェッチ用）
+    
+    Body: {"race_id": "...", "source": "nar", "race": {...}, "prompt": "..."}
+    """
+    from data_cache import set_cached_data
+    try:
+        body = await request.json()
+        race_id = body.get("race_id", "")
+        source = body.get("source", "nar")
+        race_data = body.get("race", {})
+        prompt = body.get("prompt", "")
+        if not race_id or not race_data:
+            raise HTTPException(status_code=400, detail="race_id and race are required")
+        
+        key = f"race_full_{source}_{race_id}"
+        set_cached_data(key, {"race": race_data, "prompt": prompt})
+        return {"message": f"Imported full data for race {race_id}"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/api/race_dates")
@@ -53,7 +161,6 @@ async def get_race_dates(source: str = Query("jra", description="jra or nar")):
     dates = []
 
     if source == "nar":
-        # 地方競馬: 毎日開催なので過去3日＋今日＋未来3日
         for i in range(-3, 4):
             d = today + timedelta(days=i)
             wd = weekday_names[d.weekday()]
@@ -67,7 +174,6 @@ async def get_race_dates(source: str = Query("jra", description="jra or nar")):
                 "is_today": d.date() == today.date(),
             })
     else:
-        # JRA: 土日中心
         for i in range(-7, 8):
             d = today + timedelta(days=i)
             if d.weekday() in [5, 6]:
@@ -78,7 +184,6 @@ async def get_race_dates(source: str = Query("jra", description="jra or nar")):
                     "is_past": d.date() < today.date(),
                     "is_today": d.date() == today.date(),
                 })
-        # 今日が土日でなくても含める
         if today.weekday() not in [5, 6]:
             wd = weekday_names[today.weekday()]
             dates.insert(0, {
@@ -99,7 +204,17 @@ async def get_races(
     """指定日のレース一覧を取得"""
     try:
         races = await fetch_race_list(date, source=source)
-        return {"races": [asdict(r) for r in races]}
+        return {"races": [asdict(r) for r in races], "ip_blocked": False}
+    except IPBlockedError as e:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "races": [],
+                "ip_blocked": True,
+                "error": "ip_blocked",
+                "message": str(e),
+            }
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"レース一覧取得エラー: {str(e)}")
 
@@ -123,6 +238,8 @@ async def get_race_detail_api(
             pass
 
         return {"race": asdict(race_info)}
+    except IPBlockedError as e:
+        return JSONResponse(status_code=503, content={"error": "ip_blocked", "message": str(e)})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"レース詳細取得エラー: {str(e)}")
 
@@ -138,7 +255,10 @@ async def get_race_full(
         return {
             "race": asdict(race_info),
             "prompt": prompt,
+            "ip_blocked": False,
         }
+    except IPBlockedError as e:
+        return JSONResponse(status_code=503, content={"error": "ip_blocked", "message": str(e)})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"データ取得エラー: {str(e)}")
 
@@ -152,6 +272,8 @@ async def get_prompt(
     try:
         _, prompt = await fetch_race_full_data(race_id, source=source)
         return {"prompt": prompt}
+    except IPBlockedError as e:
+        return JSONResponse(status_code=503, content={"error": "ip_blocked", "message": str(e)})
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"プロンプト生成エラー: {str(e)}")
 

@@ -1,7 +1,16 @@
-"""netkeiba.comからレースデータを取得するスクレイパー（JRA + 地方競馬対応）"""
+"""netkeiba.comからレースデータを取得するスクレイパー（JRA + 地方競馬対応）
+   - HTMLキャッシュ対応（IPブロック時のフォールバック）
+   - プロキシ設定対応
+   - リトライロジック搭載
+"""
 import re
+import os
+import json
 import asyncio
+import time
+import hashlib
 import httpx
+from pathlib import Path
 from bs4 import BeautifulSoup
 from models import (
     RaceInfo, HorseEntry, PastRace, JockeyInfo, RaceListItem
@@ -15,33 +24,185 @@ NAR_BASE_URL = "https://nar.netkeiba.com"
 DB_URL = "https://db.netkeiba.com"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
 }
+
+# レートリミット: リクエスト間隔（秒）
+REQUEST_INTERVAL = 0.5
+_last_request_time = 0.0
+
+# キャッシュディレクトリ
+CACHE_DIR = Path(os.environ.get("CACHE_DIR", "/tmp/keiba_cache"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# プロキシ設定（環境変数から）
+PROXY_URL = os.environ.get("HTTP_PROXY", "")
+
+# IPブロック検知フラグ
+_ip_blocked = False
+
+
+class IPBlockedError(Exception):
+    """netkeiba.comからIPブロックされている場合のエラー"""
+    pass
+
+
+def _cache_key(url: str) -> str:
+    """URLからキャッシュキーを生成"""
+    return hashlib.md5(url.encode()).hexdigest()
+
+
+def _get_cache_path(url: str) -> Path:
+    return CACHE_DIR / f"{_cache_key(url)}.html"
+
+
+def _get_cache(url: str) -> str | None:
+    """キャッシュからHTMLを取得"""
+    path = _get_cache_path(url)
+    if path.exists():
+        # キャッシュは24時間有効（出馬表・オッズは当日データ）
+        age = time.time() - path.stat().st_mtime
+        if age < 86400:  # 24時間
+            return path.read_text(encoding="utf-8")
+    return None
+
+
+def _set_cache(url: str, html: str):
+    """HTMLをキャッシュに保存"""
+    path = _get_cache_path(url)
+    path.write_text(html, encoding="utf-8")
+
+
+def save_html_to_cache(url: str, html: str):
+    """外部からHTMLをキャッシュに保存（プリフェッチ用）"""
+    _set_cache(url, html)
 
 
 def get_base_url(source: str) -> str:
     return NAR_BASE_URL if source == "nar" else JRA_BASE_URL
 
 
-async def get_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(
-        headers=HEADERS,
-        timeout=30.0,
-        follow_redirects=True,
-    )
+async def _fetch_url(url: str, max_retries: int = 2) -> str:
+    """URLからHTMLを取得（キャッシュ + リトライ + ブロック検知付き）"""
+    global _last_request_time, _ip_blocked
+
+    # 1. キャッシュチェック
+    cached = _get_cache(url)
+    if cached:
+        return cached
+
+    # 2. IPブロック中はキャッシュなしで即エラー
+    if _ip_blocked:
+        raise IPBlockedError(
+            f"netkeiba.comからIPブロックされています。"
+            f"キャッシュにデータがありません: {url}"
+        )
+
+    # 3. HTTP取得（リトライ付き）
+    for attempt in range(max_retries + 1):
+        # レートリミット
+        now = time.time()
+        wait = REQUEST_INTERVAL - (now - _last_request_time)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _last_request_time = time.time()
+
+        try:
+            client_kwargs = {
+                "headers": HEADERS,
+                "timeout": 30.0,
+                "follow_redirects": True,
+            }
+            if PROXY_URL:
+                client_kwargs["proxy"] = PROXY_URL
+
+            async with httpx.AsyncClient(**client_kwargs) as client:
+                resp = await client.get(url)
+
+                # IPブロック検知
+                if resp.status_code == 400 and len(resp.content) == 0:
+                    _ip_blocked = True
+                    raise IPBlockedError(
+                        f"netkeiba.comからIPブロックされています (HTTP 400, 空レスポンス)。"
+                        f"別のネットワーク/プロキシから接続するか、しばらく待ってから再試行してください。"
+                    )
+
+                if resp.status_code == 403:
+                    _ip_blocked = True
+                    raise IPBlockedError(
+                        f"netkeiba.comからアクセス拒否されました (HTTP 403)。"
+                    )
+
+                resp.raise_for_status()
+
+                # エンコーディング処理
+                # netkeiba.comは一部ページがEUC-JPで配信
+                content_type = resp.headers.get("content-type", "")
+                if "euc-jp" in content_type.lower() or "euc_jp" in content_type.lower():
+                    html = resp.content.decode("euc-jp", errors="replace")
+                elif "shift_jis" in content_type.lower():
+                    html = resp.content.decode("shift_jis", errors="replace")
+                else:
+                    # 自動検出を試みる
+                    try:
+                        html = resp.content.decode("utf-8")
+                    except UnicodeDecodeError:
+                        try:
+                            html = resp.content.decode("euc-jp", errors="replace")
+                        except:
+                            html = resp.text
+
+                # キャッシュ保存
+                if html and len(html) > 100:
+                    _set_cache(url, html)
+
+                return html
+
+        except IPBlockedError:
+            raise
+        except httpx.HTTPStatusError as e:
+            if attempt < max_retries:
+                await asyncio.sleep(1 * (attempt + 1))
+                continue
+            raise
+        except Exception as e:
+            if attempt < max_retries:
+                await asyncio.sleep(1 * (attempt + 1))
+                continue
+            raise
+
+    raise Exception(f"Failed to fetch {url} after {max_retries + 1} attempts")
+
+
+def is_ip_blocked() -> bool:
+    """IPブロック状態を返す"""
+    return _ip_blocked
+
+
+def reset_ip_block():
+    """IPブロックフラグをリセット（再試行用）"""
+    global _ip_blocked
+    _ip_blocked = False
 
 
 # ============================
 # レース一覧
 # ============================
 async def fetch_race_list(date: str, source: str = "jra") -> list[RaceListItem]:
+    # データキャッシュからのフォールバックチェック
+    from data_cache import get_cached_race_list, cache_race_list
+    cached = get_cached_race_list(date, source)
+    if cached:
+        return cached
+
     base_url = get_base_url(source)
     url = f"{base_url}/top/race_list_sub.html?kaisai_date={date}"
-    async with await get_client() as client:
-        resp = await client.get(url)
-        resp.encoding = "utf-8"
-        soup = BeautifulSoup(resp.text, "lxml")
+
+    html = await _fetch_url(url)
+    soup = BeautifulSoup(html, "lxml")
 
     races = []
     venue_blocks = soup.select("dl.RaceList_DataList")
@@ -83,7 +244,6 @@ async def fetch_race_list(date: str, source: str = "jra") -> list[RaceListItem]:
                 start_time = time_el.get_text(strip=True)
 
             if not start_time:
-                # RaceData内のspan等からも探す
                 race_data = item.select_one(".RaceData")
                 if race_data:
                     for span in race_data.select("span"):
@@ -93,7 +253,6 @@ async def fetch_race_list(date: str, source: str = "jra") -> list[RaceListItem]:
                             break
 
             if not start_time:
-                # リンク内テキストから探す
                 all_text = item.get_text(" ", strip=True)
                 tm = re.search(r'(\d{1,2}:\d{2})', all_text)
                 if tm:
@@ -105,7 +264,6 @@ async def fetch_race_list(date: str, source: str = "jra") -> list[RaceListItem]:
                 course_long = item.select_one("span.Dart, span.Shiba, span.Obstacle")
             course_info = course_long.get_text(strip=True) if course_long else ""
 
-            # コース情報が無い場合、全テキストから抽出
             if not course_info:
                 all_text = item.get_text(" ", strip=True)
                 cm = re.search(r'([芝ダ障]\d+m)', all_text)
@@ -147,6 +305,11 @@ async def fetch_race_list(date: str, source: str = "jra") -> list[RaceListItem]:
                 venue=venue_name,
                 horse_count=horse_count,
             ))
+
+    # データキャッシュに保存
+    if races:
+        cache_race_list(date, source, races)
+
     return races
 
 
@@ -154,27 +317,19 @@ async def fetch_race_list(date: str, source: str = "jra") -> list[RaceListItem]:
 # レース詳細（出走馬 + ID取得）
 # ============================
 async def fetch_race_detail(race_id: str, source: str = "jra") -> tuple[RaceInfo, dict]:
-    """
-    レース詳細＆出走馬情報を取得。
-    Returns: (RaceInfo, id_map)
-    id_map = { horse_number: {"horse_id": "...", "jockey_id": "..."} }
-    """
+    """レース詳細＆出走馬情報を取得"""
     base_url = get_base_url(source)
 
     url = f"{base_url}/race/shutuba.html?race_id={race_id}"
-    async with await get_client() as client:
-        resp = await client.get(url)
-        resp.encoding = "EUC-JP"
-        soup = BeautifulSoup(resp.text, "lxml")
+    html = await _fetch_url(url)
+    soup = BeautifulSoup(html, "lxml")
 
     table = soup.select_one(".Shutuba_Table, .RaceTable01")
     is_result = False
     if not table or len(table.select("tr.HorseList")) == 0:
         url = f"{base_url}/race/result.html?race_id={race_id}"
-        async with await get_client() as client:
-            resp = await client.get(url)
-            resp.encoding = "EUC-JP"
-            soup = BeautifulSoup(resp.text, "lxml")
+        html = await _fetch_url(url)
+        soup = BeautifulSoup(html, "lxml")
         table = soup.select_one(".Shutuba_Table, .RaceTable01, .ResultTable")
         is_result = True
 
@@ -227,7 +382,7 @@ async def fetch_race_detail(race_id: str, source: str = "jra") -> tuple[RaceInfo
 
     # --- 出走馬テーブル ---
     entries = []
-    id_map = {}  # { horse_number: {"horse_id": "...", "jockey_id": "..."} }
+    id_map = {}
 
     if table:
         rows = table.select("tr.HorseList")
@@ -315,10 +470,8 @@ async def fetch_odds(race_id: str, source: str = "jra") -> dict[str, dict]:
     base_url = get_base_url(source)
 
     url = f"{base_url}/race/result.html?race_id={race_id}"
-    async with await get_client() as client:
-        resp = await client.get(url)
-        resp.encoding = "EUC-JP"
-        soup = BeautifulSoup(resp.text, "lxml")
+    html = await _fetch_url(url)
+    soup = BeautifulSoup(html, "lxml")
 
     odds_data = {}
     for row in soup.select("tr.HorseList"):
@@ -334,10 +487,8 @@ async def fetch_odds(race_id: str, source: str = "jra") -> dict[str, dict]:
     if not odds_data:
         try:
             url2 = f"{base_url}/odds/index.html?race_id={race_id}&type=b1"
-            async with await get_client() as client:
-                resp2 = await client.get(url2)
-                resp2.encoding = "EUC-JP"
-                soup2 = BeautifulSoup(resp2.text, "lxml")
+            html2 = await _fetch_url(url2)
+            soup2 = BeautifulSoup(html2, "lxml")
             for row in soup2.select("tr.HorseList"):
                 tds = row.select("td")
                 if len(tds) < 4:
@@ -356,12 +507,12 @@ async def fetch_odds(race_id: str, source: str = "jra") -> dict[str, dict]:
 
 
 # ============================
-# 馬の過去成績（直近5走）- 正確なカラムマッピング
+# 馬の過去成績（直近5走）
 # ============================
 async def fetch_horse_past_races(horse_id: str, limit: int = 5) -> list[PastRace]:
     """
     db.netkeiba.com/horse/result/{horse_id}/ から過去成績を取得。
-    
+
     テーブルカラム(33列):
     [0]日付 [1]開催 [2]天気 [3]R [4]レース名 [5]映像 [6]頭数
     [7]枠番 [8]馬番 [9]オッズ [10]人気 [11]着順 [12]騎手 [13]斤量
@@ -371,10 +522,8 @@ async def fetch_horse_past_races(horse_id: str, limit: int = 5) -> list[PastRace
     [31]勝ち馬(2着馬) [32]賞金
     """
     url = f"{DB_URL}/horse/result/{horse_id}/"
-    async with await get_client() as client:
-        resp = await client.get(url)
-        resp.encoding = "EUC-JP"
-        soup = BeautifulSoup(resp.text, "lxml")
+    html = await _fetch_url(url)
+    soup = BeautifulSoup(html, "lxml")
 
     past_races = []
     table = soup.select_one("table.db_h_race_results, table.nk_tb_common")
@@ -422,10 +571,8 @@ async def fetch_horse_past_races(horse_id: str, limit: int = 5) -> list[PastRace
 async def fetch_jockey_info(jockey_id: str) -> JockeyInfo | None:
     """db.netkeiba.com/jockey/{jockey_id}/ から騎手プロフィール＋成績を取得"""
     url = f"{DB_URL}/jockey/{jockey_id}/"
-    async with await get_client() as client:
-        resp = await client.get(url)
-        resp.encoding = "EUC-JP"
-        soup = BeautifulSoup(resp.text, "lxml")
+    html = await _fetch_url(url)
+    soup = BeautifulSoup(html, "lxml")
 
     name_el = soup.select_one(".db_head_name h1")
     jockey_name = ""
@@ -437,7 +584,6 @@ async def fetch_jockey_info(jockey_id: str) -> JockeyInfo | None:
         if not jockey_name:
             jockey_name = name_el.get_text(strip=True).split('\n')[0].strip()
 
-    # 年度別成績テーブルを探す
     for table in soup.select("table.nk_tb_common"):
         header_row = table.select_one("tr")
         if not header_row:
@@ -474,11 +620,29 @@ async def fetch_jockey_info(jockey_id: str) -> JockeyInfo | None:
 # フルデータ取得（過去成績＋騎手情報付き）
 # ============================
 async def fetch_race_full_data(race_id: str, source: str = "jra") -> tuple[RaceInfo, str]:
-    """
-    レース全データを取得し、各馬の過去成績・騎手成績も付与する。
-    並列リクエストで高速化。
-    """
+    """レース全データを取得し、各馬の過去成績・騎手成績も付与する"""
     from prompt_generator import generate_prompt
+    from data_cache import get_cached_race_full_data, cache_race_full_data
+
+    # データキャッシュからのフォールバックチェック
+    cached = get_cached_race_full_data(race_id, source)
+    if cached:
+        race_dict, prompt = cached
+        # dictからRaceInfoに復元
+        from models import RaceInfo, HorseEntry, PastRace, JockeyInfo
+        entries = []
+        for e in race_dict.get("entries", []):
+            past_races_data = e.pop("past_races", [])
+            jockey_data = e.pop("jockey_info", None)
+            entry = HorseEntry(**e)
+            if past_races_data:
+                entry.past_races = [PastRace(**pr) for pr in past_races_data]
+            if jockey_data:
+                entry.jockey_info = JockeyInfo(**jockey_data)
+            entries.append(entry)
+        race_dict["entries"] = entries
+        ri = RaceInfo(**race_dict)
+        return ri, prompt
 
     # 1. レース詳細取得
     race_info, id_map = await fetch_race_detail(race_id, source)
@@ -515,7 +679,7 @@ async def fetch_race_full_data(race_id: str, source: str = "jra") -> tuple[RaceI
             except Exception:
                 pass
 
-    # セマフォで同時リクエスト数を制限（サーバー負荷対策）
+    # セマフォで同時リクエスト数を制限
     sem = asyncio.Semaphore(5)
 
     async def limited_fetch(entry):
@@ -526,5 +690,11 @@ async def fetch_race_full_data(race_id: str, source: str = "jra") -> tuple[RaceI
 
     # 4. プロンプト生成
     prompt = generate_prompt(race_info, source=source)
+
+    # 5. データキャッシュに保存
+    try:
+        cache_race_full_data(race_id, source, race_info, prompt)
+    except Exception:
+        pass
 
     return race_info, prompt

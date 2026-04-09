@@ -5,15 +5,29 @@ export default function RaceDetail({ raceId, source }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
+  const [ipBlocked, setIpBlocked] = useState(false)
   const [activeTab, setActiveTab] = useState('entries')
   const [expandedHorse, setExpandedHorse] = useState(null)
 
   useEffect(() => {
     setLoading(true)
     setError(null)
+    setIpBlocked(false)
     fetch(`/api/race/${raceId}/full?source=${source}`)
-      .then(r => r.json())
+      .then(r => {
+        if (r.status === 503) {
+          return r.json().then(data => {
+            setIpBlocked(true)
+            setError(data.message || 'netkeiba.comへの接続がブロックされています')
+            setLoading(false)
+            return null
+          })
+        }
+        if (!r.ok) throw new Error('Server error')
+        return r.json()
+      })
       .then(result => {
+        if (!result) return
         setData(result)
         setLoading(false)
       })
@@ -30,6 +44,28 @@ export default function RaceDetail({ raceId, source }) {
           <div className="animate-spin w-10 h-10 border-3 border-green-500 border-t-transparent rounded-full mx-auto mb-4"></div>
           <p className="text-gray-400">レースデータを取得中...</p>
           <p className="text-gray-500 text-xs sm:text-sm mt-1">出走馬・オッズ・過去成績・騎手情報を収集しています</p>
+        </div>
+      </div>
+    )
+  }
+
+  if (ipBlocked) {
+    return (
+      <div className="bg-amber-900/30 border border-amber-700 rounded-lg p-4 sm:p-6 space-y-3">
+        <div className="flex items-center gap-2 text-amber-300 font-semibold">
+          <span className="text-xl">🚫</span>
+          <span>netkeiba.com への接続がブロックされています</span>
+        </div>
+        <p className="text-amber-200/70 text-sm">
+          このサーバーのIPアドレスがnetkeiba.comからブロックされているため、レースの詳細データを取得できません。
+        </p>
+        <div className="bg-amber-950/50 rounded-lg p-3 text-xs text-amber-300/80 space-y-1">
+          <p className="font-medium text-amber-300">解決方法:</p>
+          <ul className="list-disc list-inside space-y-0.5">
+            <li>自宅のPCやサーバーでDocker版を起動する</li>
+            <li>しばらく時間を置いてから再試行する</li>
+            <li>HTTP_PROXY環境変数でプロキシを設定する</li>
+          </ul>
         </div>
       </div>
     )

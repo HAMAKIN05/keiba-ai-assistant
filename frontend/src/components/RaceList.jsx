@@ -4,15 +4,30 @@ export default function RaceList({ date, source, onSelectRace }) {
   const [races, setRaces] = useState([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
+  const [ipBlocked, setIpBlocked] = useState(false)
 
   useEffect(() => {
     if (!date) return
     setLoading(true)
     setError(null)
+    setIpBlocked(false)
     fetch(`/api/races?date=${date}&source=${source}`)
-      .then(r => r.json())
+      .then(r => {
+        if (r.status === 503) {
+          return r.json().then(data => {
+            setIpBlocked(true)
+            setError(data.message || 'netkeiba.comへの接続がブロックされています')
+            setRaces([])
+            setLoading(false)
+            return null
+          })
+        }
+        return r.json()
+      })
       .then(data => {
+        if (!data) return
         setRaces(data.races || [])
+        if (data.ip_blocked) setIpBlocked(true)
         setLoading(false)
       })
       .catch(err => {
@@ -28,6 +43,51 @@ export default function RaceList({ date, source, onSelectRace }) {
           <div className="animate-spin w-8 h-8 border-3 border-green-500 border-t-transparent rounded-full mx-auto mb-3"></div>
           <p className="text-gray-400">レース情報を取得中...</p>
         </div>
+      </div>
+    )
+  }
+
+  if (ipBlocked) {
+    return (
+      <div className="bg-amber-900/30 border border-amber-700 rounded-lg p-4 sm:p-6 space-y-3">
+        <div className="flex items-center gap-2 text-amber-300 font-semibold">
+          <span className="text-xl">🚫</span>
+          <span>netkeiba.com への接続がブロックされています</span>
+        </div>
+        <p className="text-amber-200/70 text-sm">
+          このサーバーのIPアドレスがnetkeiba.comからブロックされているため、レースデータを取得できません。
+        </p>
+        <div className="bg-amber-950/50 rounded-lg p-3 text-xs text-amber-300/80 space-y-1">
+          <p className="font-medium text-amber-300">解決方法:</p>
+          <ul className="list-disc list-inside space-y-0.5">
+            <li>自宅のPCやサーバーでDocker版を起動する（IPがブロックされていない環境）</li>
+            <li>しばらく時間を置いてから再試行する</li>
+            <li>HTTP_PROXY環境変数でプロキシを設定する</li>
+          </ul>
+        </div>
+        <button
+          onClick={() => {
+            fetch('/api/reset_block', { method: 'POST' })
+              .then(() => {
+                setIpBlocked(false)
+                setError(null)
+                setLoading(true)
+                fetch(`/api/races?date=${date}&source=${source}`)
+                  .then(r => r.json())
+                  .then(data => {
+                    setRaces(data.races || [])
+                    setLoading(false)
+                  })
+                  .catch(() => {
+                    setError('再試行に失敗しました')
+                    setLoading(false)
+                  })
+              })
+          }}
+          className="px-4 py-2 bg-amber-700 text-white rounded-lg text-sm hover:bg-amber-600 transition-colors cursor-pointer"
+        >
+          🔄 再試行する
+        </button>
       </div>
     )
   }
@@ -61,8 +121,6 @@ export default function RaceList({ date, source, onSelectRace }) {
     if (!grouped[venue]) grouped[venue] = []
     grouped[venue].push(race)
   })
-
-  const accentColor = source === 'nar' ? 'amber' : 'green'
 
   return (
     <div className="space-y-6">
